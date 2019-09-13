@@ -1,0 +1,728 @@
+<html>
+
+<head>
+    <title>
+        Confitty web demo
+    </title>
+
+    <style>
+        .wrap-grid {
+            display: grid;
+            grid-gap: 10px;
+            /* grid-template-columns: repeat(auto-fill, minmax(186px, 1fr)); */
+            grid-template-columns: repeat(auto-fill, minmax(1080px, 1fr));
+            /* top: 0;
+            left: 0;
+            position: absolute; */
+        }
+
+        .wrap-grid>* {
+            background-color: blue;
+        }
+
+        .wrap-all {
+            width: 100%;
+            height: 100%;
+        }
+
+        video {
+            width: 100%;
+            height: auto;
+        }
+    </style>
+
+    <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+    <script src="https://rawgit.com/otalk/sdp/master/sdp.js"></script>
+
+    <script>
+        'use strict';
+        const browserInfo = {
+            isChromiumBased: navigator.userAgent.includes("Chrome/") || navigator.userAgent.includes("Chromium/"),
+            isFirefox: navigator.userAgent.includes("Gecko/") && navigator.userAgent.includes("Firefox/"),
+        };
+
+        const confettyURL = window.location.origin + "/";
+        const SDPSemantics = browserInfo.isFirefox ? "unified-plan" : "plan-b";
+
+        const predefinedICEServers = [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:stun.services.mozilla.com" },
+            { urls: "stun:stun1.l.google.com:19302" },
+            { urls: "stun:stun2.l.google.com:19302" },
+        ]
+
+        function dcCreateEndpointMessage(confId, payload) {
+            return {
+                colibriClass: "EndpointMessage",
+                to: "Supervisor-" + confId,
+                msgPayload: payload
+            };
+        }
+
+
+        function dcCreatePeerInfo(confId, peerInfo) {
+            return dcCreateEndpointMessage(confId, {
+                type: "PeerInfoNotification",
+                PeerInfoNotification: peerInfo
+            });
+        }
+
+        class PromiseQueue {
+            constructor() {
+                this.queue = [];
+                this.running = false
+            }
+
+            execute(promiseFactory) {
+                this.queue.push(promiseFactory);
+                this.ensureRunning();
+            }
+
+            async ensureRunning() {
+                if (this.running) {
+                    return;
+                }
+                this.running = true;
+
+                while (this.queue.length > 0) {
+                    let promiseFactory = this.queue.shift();
+                    try {
+                        await promiseFactory();
+                    }
+                    catch (e) {
+                        console.log("Error while executing promise: ", e)
+                    }
+                }
+
+                this.running = false;
+            }
+        }
+
+        function logSdp(tag, sdp) {
+            let ta = document.getElementById("sdpLog");
+            ta.value = ta.value + tag + "\n" + sdp + "\n\n\n"
+        }
+
+        function convertID(id) {
+            return id;
+            if (id.startsWith(selfID.mid)) {
+                return selfID.mid;
+            }
+            return id;
+        }
+
+        async function makeDominant(id) {
+            return;
+            console.log("Before dominant id = " + id);
+            id = convertID(id);
+            console.log("After dominant id = " + id);
+            if (dominantID == id) {
+                return;
+            }
+
+            if (dominantID) {
+                document.getElementById("V-" + dominantID).hidden = false;
+            }
+
+            let dominatVideoTag = document.getElementById("V-" + id)
+            dominatVideoTag.hidden = true;
+
+            dominantID = id;
+
+            let dc = document.getElementById("dominant_video");
+            dc.srcObject = dominatVideoTag.srcObject;
+        }
+
+        async function addVideoStream(id, stream, container) {
+            id = convertID(id);
+            let existingVideoElement = document.getElementById("V-" + id);
+            if (existingVideoElement) {
+                existingVideoElement.srcObject = stream;
+                return;
+            }
+
+            let video = document.createElement("video");
+            video.className = "video peervideo";
+            video.id = "V-" + id;
+            video.autoplay = true;
+            video.muted = true;
+            video.srcObject = stream;
+            container.appendChild(video);
+        }
+
+        async function addAudioStream(id, stream, container) {
+            id = convertID(id);
+            let existingAudioElement = document.getElementById("A-" + id);
+            if (existingAudioElement) {
+                existingAudioElement.srcObject = stream;
+                return;
+            }
+
+            let audio = document.createElement("audio");
+            audio.id = "A-" + id;
+            audio.autoplay = true;
+            audio.muted = false;
+            audio.srcObject = stream;
+            container.appendChild(audio);
+        }
+
+        async function addSelfStream(stream) {
+            let vc = document.getElementById("video_container");
+            addVideoStream(selfID.mid, stream, vc);
+        }
+
+        async function addRemoteStream(stream) {
+            let vc = document.getElementById("video_container");
+            addVideoStream(stream.id, stream, vc);
+            addAudioStream(stream.id, stream, vc);
+        }
+
+        const removeRemoteStream = (stream) => {
+            let d = document.getElementById(stream.id);
+            d && (d.outerHTML = '');
+        }
+
+        const delay = ms => new Promise(res => setTimeout(res, ms))
+
+        const trySendPeerInfoNotification = (() => {
+            let isRetryLoopRunning = false;
+            return async () => {
+                if (isRetryLoopRunning) {
+                    console.log("sendPeerInfoNotification: retry loop is already running")
+                    return
+                }
+                isRetryLoopRunning = true;
+                const maxDelayMs = 30 * 1000;
+                let currentDelayMs = 2000;
+                while (!confInfoNotificationReceived) {
+                    if (dataChannel.readyState === "open") {
+                        await sendPeerInfoNotification();
+                    }
+                    await delay(currentDelayMs);
+                    if (currentDelayMs < maxDelayMs) {
+                        currentDelayMs = Math.min(currentDelayMs * 1.2, maxDelayMs);
+                    }
+                }
+                isRetryLoopRunning = false
+            }
+        })();
+
+        const waitGatheringCompleted = async () => {
+            await new Promise((resolve, reject) => {
+                if (peerConnection.iceGatheringState === 'complete') {
+                    console.log("ICE gathering completed");
+                    resolve();
+                } else {
+                    peerConnection.onicegatheringstatechange = () => {
+                        if (peerConnection.iceGatheringState === 'complete') {
+                            console.log("ICE gathering completed");
+                            resolve();
+                        }
+                    };
+                }
+            })
+        }
+
+        const onRemoteTrackAdded = (event) => {
+            let transceiver = event.transceiver;
+            let stream = event.streams[0];
+
+            if (!stream || !transceiver) {
+                console.warn("ontrack missing transceiver ", transceiver, " or stream ", stream);
+                return;
+            }
+
+            console.log("[RemoteTrack]: ", event);
+            console.log("[RemoteTrack]: pc.ontrack with transceiver(", transceiver.mid, ") and stream (", stream.id, ")");
+            console.log("[RemoteTrack]: track = ", event.track);
+
+            event.track.onended = () => {
+                console.log("[TrackEvent]: onended track = ", event.track);
+            }
+
+            event.track.onmute = () => {
+                console.log("[TrackEvent]: onmute track = ", event.track);
+            }
+
+            event.track.onunmute = () => {
+                console.log("[TrackEvent]: onunmute track = ", event.track);
+            }
+
+            for (const s of event.streams) {
+                console.log("[TrackEvent]: stream = ", s);
+                s.onactive = () => {
+                    console.log("[TrackEvent]: stream active");
+                }
+                s.oninactive = () => {
+                    console.log("[TrackEvent]: stream inactive");
+                }
+                s.onaddtrack = () => {
+                    console.log("[TrackEvent]: stream onaddtrack");
+                }
+                s.onremovetrack = () => {
+                    console.log("[TrackEvent]: stream onremovetrack");
+                }
+                addRemoteStream(s)
+            }
+        };
+
+        async function sendPeerInfoNotification() {
+            let peerInfo = {
+                protocolVersion: "1.0",
+                sdpPlan: SDPSemantics,
+                selfId: selfID,
+                selfState: (isJoined ? "connected" : "disconnected"),
+                muted: peerConnection.getSenders().reduce((acc, sender) => acc && (!sender.track || sender.track.muted), true),
+                sendVideo: true,
+                recvVideo: true,
+            }
+
+            let peerInfoNotification = dcCreatePeerInfo(confID, peerInfo);
+            console.log("Track [DC] -> ", JSON.stringify(peerInfoNotification));
+            dataChannel.send(JSON.stringify(peerInfoNotification));
+        }
+
+        function getRandomString(len) {
+            let val = new Uint8Array(8)
+            window.crypto.getRandomValues(val)
+            return btoa(val).substring(0, len)
+        }
+
+        let selfID = (function () {
+            let mid = new Uint8Array(8);
+            window.crypto.getRandomValues(mid);
+            return {
+                // from ABProcessor.cpp: member id's are generated by encoding 8-bytes in Base64. The output will always have this format
+                mid: btoa(mid).substring(0, 11) + "=", // mid always ends with =
+                cid: Math.round(Math.random() * 100000),
+                web: true,
+            }
+        })();
+        let dominantID = null;
+        let confID = null;
+        let isJoined = false;
+        let peerConnection = null;
+        let dataChannel = null;
+        let promiseQueue = new PromiseQueue();
+        let confInfoNotificationReceived = false;
+
+        const nativeCreateOffer = window.RTCPeerConnection.prototype.createOffer;
+        window.RTCPeerConnection.prototype.createOffer = function () {
+            const offerOptions = arguments.length === 3 ? arguments[2] : arguments[0];
+            if (!(offerOptions && offerOptions.numberOfSimulcastLayers > 1)) {
+                return nativeCreateOffer.apply(this, arguments);
+            }
+
+            const { numberOfSimulcastLayers } = offerOptions;
+            delete offerOptions.numberOfSimulcastLayers;
+            return nativeCreateOffer.apply(this, arguments)
+                .then(({ type, sdp }) => {
+                    const sections = SDPUtils.splitSections(sdp);
+                    /* sdp munging code. Really, its just extracting some information (ssrc, cname and msid) and reusing it.
+                        * It could just set a different set of ssrc instead of trying to reuse the first.
+                        */
+                    // TODO: searching the (first?) video m-line would need to be generalized a bit.
+                    let cname;
+                    let msid;
+                    let mslabel;
+                    let label;
+                    SDPUtils.matchPrefix(sections[2], 'a=ssrc:').forEach(line => {
+                        const media = SDPUtils.parseSsrcMedia(line);
+                        if (media.attribute === 'cname') {
+                            cname = media.value;
+                        } else if (media.attribute === 'msid') {
+                            msid = media.value;
+                        } else if (media.attibute === 'mslabel') {
+                            mslabel = meida.value;
+                        } else if (media.attibute === 'label') {
+                            label = media.value;
+                        }
+                    });
+                    const fidGroup = SDPUtils.matchPrefix(sections[2], 'a=ssrc-group:FID ')[0].substr(17);
+                    const lines = sections[2].trim().split('\r\n').filter(line => {
+                        return line.indexOf('a=ssrc:') !== 0 && line.indexOf('a=ssrc-group:') !== 0;
+                    });
+                    const simSSRCs = [];
+                    const [videoSSRC1, rtxSSRC1] = fidGroup.split(' ').map(ssrc => parseInt(ssrc, 10));
+                    lines.push('a=ssrc:' + videoSSRC1 + ' cname:' + cname);
+                    lines.push('a=ssrc:' + videoSSRC1 + ' msid:' + msid);
+                    lines.push('a=ssrc:' + videoSSRC1 + ' mslabel:' + mslabel);
+                    lines.push('a=ssrc:' + videoSSRC1 + ' label:' + label);
+                    lines.push('a=ssrc:' + rtxSSRC1 + ' cname:' + cname);
+                    lines.push('a=ssrc:' + rtxSSRC1 + ' msid:' + msid);
+                    lines.push('a=ssrc:' + rtxSSRC1 + ' mslabel:' + mslabel);
+                    lines.push('a=ssrc:' + rtxSSRC1 + ' label:' + label);
+                    lines.push('a=ssrc-group:FID ' + videoSSRC1 + ' ' + rtxSSRC1);
+                    simSSRCs.push(videoSSRC1);
+                    if (numberOfSimulcastLayers >= 2) {
+                        const videoSSRC2 = videoSSRC1 + 1;
+                        const rtxSSRC2 = videoSSRC1 + 2;
+                        lines.push('a=ssrc:' + videoSSRC2 + ' cname:' + cname);
+                        lines.push('a=ssrc:' + videoSSRC2 + ' msid:' + msid);
+                        lines.push('a=ssrc:' + videoSSRC2 + ' mslabel:' + mslabel);
+                        lines.push('a=ssrc:' + videoSSRC2 + ' label:' + label);
+                        lines.push('a=ssrc:' + rtxSSRC2 + ' cname:' + cname);
+                        lines.push('a=ssrc:' + rtxSSRC2 + ' msid:' + msid);
+                        lines.push('a=ssrc:' + rtxSSRC2 + ' mslabel:' + mslabel);
+                        lines.push('a=ssrc:' + rtxSSRC2 + ' label:' + label);
+                        lines.push('a=ssrc-group:FID ' + videoSSRC2 + ' ' + rtxSSRC2);
+                        simSSRCs.push(videoSSRC2);
+                    }
+                    if (numberOfSimulcastLayers >= 3) {
+                        const videoSSRC3 = videoSSRC1 + 3;
+                        const rtxSSRC3 = videoSSRC1 + 4;
+                        lines.push('a=ssrc:' + videoSSRC3 + ' cname:' + cname);
+                        lines.push('a=ssrc:' + videoSSRC3 + ' msid:' + msid);
+                        lines.push('a=ssrc:' + videoSSRC3 + ' mslabel:' + mslabel);
+                        lines.push('a=ssrc:' + videoSSRC3 + ' label:' + label);
+                        lines.push('a=ssrc:' + rtxSSRC3 + ' cname:' + cname);
+                        lines.push('a=ssrc:' + rtxSSRC3 + ' msid:' + msid);
+                        lines.push('a=ssrc:' + rtxSSRC3 + ' mslabel:' + mslabel);
+                        lines.push('a=ssrc:' + rtxSSRC3 + ' label:' + label);
+                        lines.push('a=ssrc-group:FID ' + videoSSRC3 + ' ' + rtxSSRC3);
+                        simSSRCs.push(videoSSRC3);
+                    }
+                    if (numberOfSimulcastLayers >= 4) {
+                        const videoSSRC4 = videoSSRC1 + 5;
+                        const rtxSSRC4 = videoSSRC1 + 6;
+                        lines.push('a=ssrc:' + videoSSRC4 + ' cname:' + cname);
+                        lines.push('a=ssrc:' + videoSSRC4 + ' msid:' + msid);
+                        lines.push('a=ssrc:' + videoSSRC4 + ' mslabel:' + mslabel);
+                        lines.push('a=ssrc:' + videoSSRC4 + ' label:' + label);
+                        lines.push('a=ssrc:' + rtxSSRC4 + ' cname:' + cname);
+                        lines.push('a=ssrc:' + rtxSSRC4 + ' msid:' + msid);
+                        lines.push('a=ssrc:' + rtxSSRC4 + ' mslabel:' + mslabel);
+                        lines.push('a=ssrc:' + rtxSSRC4 + ' label:' + label);
+                        lines.push('a=ssrc-group:FID ' + videoSSRC4 + ' ' + rtxSSRC4);
+                        simSSRCs.push(videoSSRC4);
+                    }
+                    if (numberOfSimulcastLayers >= 5) {
+                        const videoSSRC5 = videoSSRC1 + 7;
+                        const rtxSSRC5 = videoSSRC1 + 8;
+                        lines.push('a=ssrc:' + videoSSRC5 + ' cname:' + cname);
+                        lines.push('a=ssrc:' + videoSSRC5 + ' msid:' + msid);
+                        lines.push('a=ssrc:' + videoSSRC5 + ' mslabel:' + mslabel);
+                        lines.push('a=ssrc:' + videoSSRC5 + ' label:' + label);
+                        lines.push('a=ssrc:' + rtxSSRC5 + ' cname:' + cname);
+                        lines.push('a=ssrc:' + rtxSSRC5 + ' msid:' + msid);
+                        lines.push('a=ssrc:' + rtxSSRC5 + ' mslabel:' + mslabel);
+                        lines.push('a=ssrc:' + rtxSSRC5 + ' label:' + label);
+                        lines.push('a=ssrc-group:FID ' + videoSSRC5 + ' ' + rtxSSRC5);
+                        simSSRCs.push(videoSSRC5);
+                    }
+                    lines.push('a=ssrc-group:SIM ' + simSSRCs.join(' '));
+                    sections[2] = lines.join('\r\n') + '\r\n';
+                    return new RTCSessionDescription({ type, sdp: sections.join('') });
+                });
+        }
+
+        function createConference() {
+            fetch(confettyURL + "create_conference", {
+                method: "POST",
+                body: JSON.stringify({
+                    ctok: getRandomString(10)
+                }),
+            }).then(function (response) {
+                return response.json()
+            }).then(function (createConfResponse) {
+                confID = createConfResponse["conferenceID"];
+                joinToConference();
+            }).catch(function (e) {
+                console.error("unable to create conference: ", e)
+            })
+        }
+
+        function conferenceList() {
+            fetch(confettyURL + "conference_list", {
+                method: "POST",
+                body: "",
+            }).then(function (response) {
+                return response.json()
+            }).then(function (confListResponse) {
+                if (confListResponse.length > 0) {
+                    confID = confListResponse[0];
+                    joinToConference();
+                } else {
+                    createConference();
+                }
+            }).catch(function (e) {
+                console.error("uanble to get conference list: ", e)
+            })
+        }
+
+        async function getMediaStream() {
+            let stream = null
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: 1,
+                    },
+                    video: {
+                        width: 640,
+                        frameRate: 30
+                    },
+                })
+                console.log("Local stream created " + stream)
+            } catch (e) {
+                console.error("Unable to obtain local media stream: ", e)
+            }
+
+            return stream
+        }
+
+        async function createPeerConnection(stream) {
+            peerConnection = new RTCPeerConnection({
+                bundlePolicy: "max-bundle",
+                sdpSemantics: SDPSemantics,
+                iceServers: [],
+                iceCandidatePoolSize: 6,
+                rtcpMuxPolicy: "require",
+            });
+
+            if (stream) {
+                //peerConnection.addStream(stream);
+                //addSelfStream(stream);
+                //makeDominant(selfID.mid);
+
+                for (const track of stream.getTracks()) {
+                    peerConnection.addTrack(track)
+                }
+                addSelfStream(stream)
+            }
+
+            peerConnection.onicecandidate = (ice) => {
+                if (ice.candidate) {
+                    console.log("Local ICE cadidate: ", ice.candidate);
+                }
+            };
+
+            if (SDPSemantics == "unified-plan") {
+                // https://blog.mozilla.org/webrtc/rtcrtptransceiver-explored/
+                peerConnection.ontrack = onRemoteTrackAdded;
+            } else {
+                peerConnection.onaddstream = (evt) => {
+                    console.log("Adding remote stream " + evt);
+                    evt.stream.onaddtrack = (track) => {
+                        console.log("track added: ", track);
+                    }
+                    addRemoteStream(evt.stream);
+                    console.log("Finished adding stream");
+                };
+            }
+
+            peerConnection.onsignalingstatechange = ({ target }) => {
+                console.log("Signaling state changed: " + target.signalingState);
+            }
+
+            peerConnection.oniceconnectionstatechange = async ({ target }) => {
+                console.log("ICE state changed: " + target.iceConnectionState);
+                if (target.iceConnectionState === "failed") {
+                    //reconnect()
+                } else if (target.iceConnectionState === "disconnected") {
+                    //await delay(1500)
+                    if (target.iceConnectionState === "disconnected") {
+                        //reconnect()
+                    }
+                } else if (target.iceConnectionState === "connected") {
+                    //trySendPeerInfoNotification();
+                }
+            };
+        }
+
+        async function stopTracks() {
+            for (let sender of peerConnection.getSenders()) {
+                if (sender.track) {
+                    sender.track.stop();
+                }
+            }
+        }
+
+        async function handlePeersNotification(peers) {
+            if (!peers) {
+                return;
+            }
+
+            for (let peerInfo of peers) {
+                confInfoNotificationReceived = true;
+
+                if (peerInfo.peerId.mid === selfID.mid &&
+                    peerInfo.peerId.cid === selfID.cid) {
+                    if (peerInfo.state === "disconnected") {
+                        stopTracks();
+                        peerConnection.close();
+                        return;
+                    }
+                } else {
+                    // update info about other peers
+                }
+            }
+        }
+
+        async function handleSdpOfferNotification(offer) {
+            if (!offer) {
+                return;
+            }
+
+            try {
+                if (peerConnection.signalingState !== "stable") {
+                    console.error(`Wrong local pc state ${peerConnection.signalingState}`);
+                    return;
+                }
+
+                console.log("[ConfInfoNotification] setting remote offer");
+                logSdp("---------------------------------------------> handleConfInfoNotification: sdp remote offer:", offer);
+
+                await peerConnection.setRemoteDescription({
+                    type: "offer",
+                    sdp: offer
+                });
+
+                let sdpAnswer = await peerConnection.createAnswer();
+
+                await peerConnection.setLocalDescription(sdpAnswer);
+                logSdp("---------------------------------------------> handleConfInfoNotification: sdp local answer:", peerConnection.localDescription.sdp);
+            } catch (e) {
+                console.error("Failed to apply remote SDP: ", e);
+                logSdp("---------------------------------------------> handleConfInfoNotification: sdp remote offer FAILED:", offer);
+                //throw e;
+            }
+        }
+
+        async function handleConfInfoNotification(confInfo) {
+            console.log("ConfInfoNotification: seq = ", confInfo.seq, ", info = ", confInfo)
+            if (confInfo.peers) {
+                handlePeersNotification(confInfo.peers)
+            }
+
+            if (confInfo.sdpOffer) {
+                handleSdpOfferNotification(confInfo.sdpOffer)
+            }
+        }
+
+        async function processEndpointMessage(endpointMessage) {
+            try {
+                if (endpointMessage.msgPayload.ConfInfoNotification) {
+                    await handleConfInfoNotification(endpointMessage.msgPayload.ConfInfoNotification)
+                }
+            } catch (e) {
+                console.error("error " + e + " processing endpoint message: " + JSON.stringify(endpointMessage))
+            }
+        }
+
+        async function createDataChannel() {
+            dataChannel = peerConnection.createDataChannel("default", { id: 0 });
+            dataChannel.onmessage = async function (event) {
+                console.log(" [DC] <- enqueing ", event.data);
+                promiseQueue.execute(async () => {
+                    trySendPeerInfoNotification();
+
+                    let msg = JSON.parse(event.data);
+                    console.log(" [DC] <- handling ", msg);
+
+                    if (msg.colibriClass === "EndpointMessage") {
+                        await processEndpointMessage(msg);
+                    } else if (msg.colibriClass === "DominantSpeakerEndpointChangeEvent") {
+                        console.log("dominant speaker message from [DC]: ", JSON.stringify(msg));
+                        //makeDominant(msg["dominantSpeakerEndpoint"]);
+                    } else if (msg.colibriClass === "EndpointConnectivityStatusChangeEvent") {
+                        // console.log("endpoint connectivity status change event [DC]: ", JSON.stringify(msg));
+                    } else {
+                        console.warn("unknown message from [DC]: ", JSON.stringify(msg));
+                    }
+                    console.log(" [DC] <- handled");
+                })
+            };
+
+            dataChannel.onopen = async function (event) {
+                console.log("data channel onopen");
+            };
+        }
+
+        async function joinConferenceReply(remoteSdp) {
+            try {
+                // legacy path, offer wat sent to join
+                if (peerConnection.signalingState === "have-local-offer") {
+                    await peerConnection.setRemoteDescription({
+                        "type": "answer",
+                        "sdp": remoteSdp,
+                    });
+                } else if (peerConnection.signalingState === "stable") {
+                    await peerConnection.setRemoteDescription({
+                        type: "offer",
+                        sdp: remoteSdp
+                    })
+
+                    let localAnswer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(localAnswer);
+                } else {
+                    console.warn("Unexpected signaling state " + peerConnection.signalingState);
+                }
+
+                console.log("Finished setting the SDPs, maybe waiting for ICE state change");
+
+                //Workaroud for re-join
+                //confInfoNotificationReceived = false
+                isJoined = true
+                trySendPeerInfoNotification()
+            } catch (e) {
+                console.error(e)
+            }
+        }
+
+        async function joinToConference() {
+            let stream = await getMediaStream()
+            createPeerConnection(stream)
+            createDataChannel();
+
+            let offer = await peerConnection.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true,
+                numberOfSimulcastLayers: -1,
+            });
+
+            await peerConnection.setLocalDescription(offer);
+
+            await waitGatheringCompleted();
+
+            console.log("Joining conference " + confID + " as " + JSON.stringify(selfID));
+            logSdp("--------------------------------------------->create offer for join conf:", peerConnection.localDescription.sdp);
+
+            fetch(confettyURL + "connect_to_conference", {
+                method: "POST",
+                body: JSON.stringify({
+                    conferenceID: confID,
+                    peer: selfID,
+                    sdp: peerConnection.localDescription.sdp,
+                    sdpPlan: SDPSemantics,
+                })
+            }).then(function (response) {
+                return response.json()
+            }).then(function (connectToConfResponse) {
+                console.log("join reply: ", connectToConfResponse);
+                logSdp("---------------------------------------------> connect to conference remote reply sdp:", connectToConfResponse["sdp"]);
+                joinConferenceReply(connectToConfResponse["sdp"]);
+            }).catch(function (e) {
+                console.error("Unable to connect to conference: ", e)
+            })
+        }
+
+        async function start() {
+            document.getElementById("start_button").hidden = true
+            conferenceList()
+        }
+    </script>
+</head>
+
+<body>
+    <button style="text-align: center" id="start_button" onclick="javascript:start()">start conference</button>
+    <!-- <div id="dominant_container" class="wrap-all">
+        <video id="dominant_video" class="video" autoplay=true muted=true>
+        </video>
+    </div> -->
+    <div id="video_container" class="wrap-grid"></div>
+    <textarea class="wrap-all" id="sdpLog"></textarea>
+
+</body>
+
+</html>
