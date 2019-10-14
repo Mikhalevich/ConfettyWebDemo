@@ -707,15 +707,23 @@
             })
         }
 
-        async function start() {
-            document.getElementById("start_button").hidden = true
+        async function create() {
+            document.getElementById("conf_create_button").hidden = true
+            document.getElementById("conf_join_button").hidden = true
+            createConference()
+        }
+
+        async function join() {
+            document.getElementById("conf_create_button").hidden = true
+            document.getElementById("conf_join_button").hidden = true
             conferenceList()
         }
     </script>
 </head>
 
 <body>
-    <button style="text-align: center" id="start_button" onclick="javascript:start()">start conference</button>
+    <button style="text-align: center" id="conf_create_button" onclick="javascript:create()">create conference</button>
+    <button style="text-align: center" id="conf_join_button" onclick="javascript:join()">join conference</button>
     <!-- <div id="dominant_container" class="wrap-all">
         <video id="dominant_video" class="video" autoplay=true muted=true>
         </video>
