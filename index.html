@@ -26,7 +26,7 @@
         }
 
         video {
-            width: 100%;
+            width: 40%;
             height: auto;
         }
     </style>
@@ -43,6 +43,7 @@
 
         const confettyURL = window.location.origin + "/";
         const SDPSemantics = browserInfo.isFirefox ? "unified-plan" : "plan-b";
+        //const SDPSemantics = "unified-plan";
 
         const predefinedICEServers = [
             { urls: "stun:stun.l.google.com:19302" },
@@ -148,6 +149,44 @@
             video.muted = true;
             video.srcObject = stream;
             container.appendChild(video);
+
+            if (selfID.mid == id) {
+                return
+            }
+
+            window.setInterval(async () => {
+                const videoTrack = stream.getVideoTracks()[0];
+                if (!videoTrack) {
+                    return;
+                }
+
+                const reports = await peerConnection.getStats(videoTrack);
+                reports.forEach(report => {
+                    if (report.type === "track") {
+                        const time = report.timestamp;
+                        const frames = report.framesDecoded;
+                        const width = report.frameWidth;
+                        const height = report.frameHeight;
+
+                        if (!width || !height) {
+                            return;
+                        }
+
+                        if (video.savedTime && video.savedFrames) {
+                            const frameRate = Math.round((frames - video.savedFrames) / (time - video.savedTime) * 1000);
+                            video.title = `${width}x${height}x${frameRate}`;
+                        } else {
+                            video.title = `${width}x${height}`;
+                        }
+
+                        video.savedTime = time;
+                        video.savedFrames = frames;
+
+                        console.log(`Video stats for peer are: ${video.title}`);
+                        return;
+                    }
+                });
+            }, 1000);
         }
 
         async function addAudioStream(id, stream, container) {
@@ -262,7 +301,16 @@
                 s.onremovetrack = () => {
                     console.log("[TrackEvent]: stream onremovetrack");
                 }
-                addRemoteStream(s)
+                //addRemoteStream(s)
+
+                let vc = document.getElementById("video_container");
+                if (event.track.kind === "video") {
+                    console.log("video stream added")
+                    addVideoStream(stream.id, stream, vc);
+                } else if (event.track.kind === "audio") {
+                    console.log("audio stream added")
+                    addAudioStream(stream.id, stream, vc);
+                }
             }
         };
 
@@ -305,6 +353,7 @@
         let dataChannel = null;
         let promiseQueue = new PromiseQueue();
         let confInfoNotificationReceived = false;
+        let videoSender = null;
 
         const nativeCreateOffer = window.RTCPeerConnection.prototype.createOffer;
         window.RTCPeerConnection.prototype.createOffer = function () {
@@ -459,8 +508,8 @@
                         echoCancellation: 1,
                     },
                     video: {
-                        width: 640,
-                        frameRate: 30
+                        height: 720,
+                        //frameRate: 30,
                     },
                 })
                 console.log("Local stream created " + stream)
@@ -486,7 +535,11 @@
                 //makeDominant(selfID.mid);
 
                 for (const track of stream.getTracks()) {
-                    peerConnection.addTrack(track)
+                    let sender = peerConnection.addTrack(track)
+                    
+                    if (track.kind == "video") {
+                        videoSender = sender;
+                    }
                 }
                 addSelfStream(stream)
             }
@@ -502,7 +555,7 @@
                 peerConnection.ontrack = onRemoteTrackAdded;
             } else {
                 peerConnection.onaddstream = (evt) => {
-                    console.log("Adding remote stream " + evt);
+                    console.log("Adding remote stream " + evt.stream.id);
                     evt.stream.onaddtrack = (track) => {
                         console.log("track added: ", track);
                     }
@@ -538,10 +591,25 @@
             }
         }
 
+        async function sendSelectedEndpointsNotification(peerIDs) {
+            let message = {
+                colibriClass: "SelectedEndpointsChangedEvent",
+                to: "Supervisor-" + confID,
+                selectedEndpoints: peerIDs,
+            };
+
+            console.log("Track [DC] -> ", JSON.stringify(message));
+            dataChannel.send(JSON.stringify(message));
+        }
+
+        let peerIDs = []
+
         async function handlePeersNotification(peers) {
             if (!peers) {
                 return;
             }
+
+            let sendNotification = false;
 
             for (let peerInfo of peers) {
                 confInfoNotificationReceived = true;
@@ -554,8 +622,17 @@
                         return;
                     }
                 } else {
-                    // update info about other peers
+                    if (peerInfo.jitsiId != null && peerInfo.peerState === "connected") {
+                        if (peerIDs.indexOf(peerInfo.jitsiId) < 0) {
+                            peerIDs.push(peerInfo.jitsiId);
+                            sendNotification = true;
+                        }
+                    }
                 }
+            }
+
+            if (sendNotification) {
+                await sendSelectedEndpointsNotification(peerIDs)
             }
         }
 
@@ -678,7 +755,7 @@
             let offer = await peerConnection.createOffer({
                 offerToReceiveAudio: true,
                 offerToReceiveVideo: true,
-                numberOfSimulcastLayers: -1,
+                numberOfSimulcastLayers: 3,
             });
 
             await peerConnection.setLocalDescription(offer);
